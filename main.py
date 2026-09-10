@@ -98,11 +98,13 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
 
 # ---------- Telegram Markdown escaping ----------
 
-def _escape_md(text: str) -> str:
+def _escape_md(text) -> str:
     """Escape Telegram Markdown V1 special characters in user/LLM content.
     We use Markdown V1 (parse_mode='Markdown') which treats * _ ` [ as special.
     """
-    # Replace backslash first to avoid double-escaping
+    if text is None:
+        return ""
+    text = str(text)
     text = text.replace("\\", "\\\\")
     for ch in ("*", "_", "`", "["):
         text = text.replace(ch, f"\\{ch}")
@@ -496,7 +498,11 @@ async def compare_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         comparison_text = _build_comparison(resumes, name_a, name_b)
-        await update.message.reply_text(comparison_text, parse_mode="Markdown")
+        try:
+            await update.message.reply_text(comparison_text, parse_mode="Markdown")
+        except BadRequest:
+            plain = comparison_text.replace("*", "").replace("`", "")
+            await update.message.reply_text(plain)
 
         # Send comparison chart
         chart_resumes = OrderedDict()
@@ -520,7 +526,7 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No resumes scored in this session yet.")
         return
 
-    jd_name = state.get("jd_name", "Unknown JD")
+    jd_name = _escape_md(state.get("jd_name", "Unknown JD"))
     lines = [f"*Session History* (JD: {jd_name})", ""]
 
     header = f"{'#':<4} {'Resume':<28} {'ATS':>5} {'Match':>5} {'Band':<10}"
@@ -535,7 +541,12 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{i:<4} {short:<28} {ats:>5} {match:>5} {band:<10}")
 
     lines.append("```")
-    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    msg = "\n".join(lines)
+    try:
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except BadRequest:
+        plain = msg.replace("*", "").replace("`", "").replace("\\", "")
+        await update.message.reply_text(plain)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):

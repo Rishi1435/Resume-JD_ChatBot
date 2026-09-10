@@ -96,19 +96,101 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
         raise ValueError("Unsupported file type. Please send a PDF, DOCX, or TXT file.")
 
 
-# ---------- Telegram Markdown escaping ----------
+# ---------- Telegram Markdown sanitization ----------
 
-def _escape_md(text) -> str:
-    """Escape Telegram Markdown V1 special characters in user/LLM content.
-    We use Markdown V1 (parse_mode='Markdown') which treats * _ ` [ as special.
-    """
+def _clean_text(text) -> str:
+    """Sanitize text for Telegram Markdown V1 to prevent unmatched entity errors."""
     if text is None:
         return ""
     text = str(text)
-    text = text.replace("\\", "\\\\")
-    for ch in ("*", "_", "`", "["):
-        text = text.replace(ch, f"\\{ch}")
-    return text
+    for ch in ("*", "_", "`", "[", "]"):
+        text = text.replace(ch, "")
+    return text.strip()
+
+
+def _escape_md(text) -> str:
+    """Backwards compatibility alias for _clean_text."""
+    return _clean_text(text)
+
+
+def classify_document(filename: str, text: str, caption: str = "") -> str:
+    """Classify whether an uploaded document is a Job Description ('jd') or a Resume ('resume').
+    Uses caption, filename, and content heuristics."""
+    # 1. Check caption (highest explicit user intent)
+    caption_clean = caption.strip().lower() if caption else ""
+    if re.search(r"\b(jd|job\s*desc(ription)?|job\s*spec|role)\b", caption_clean):
+        return "jd"
+    if re.search(r"\b(resume|cv|curriculum\s*vitae|bio)\b", caption_clean):
+        return "resume"
+
+    # 2. Check filename
+    fn = filename.lower()
+    is_fn_jd = bool(re.search(r"\b(jd|job\s*desc(ription)?|job\s*spec|job\s*posting|role\s*desc(ription)?)\b", fn))
+    is_fn_resume = bool(re.search(r"\b(resume|cv|curriculum\s*vitae|biodata)\b", fn))
+
+    if is_fn_jd and not is_fn_resume:
+        return "jd"
+    if is_fn_resume and not is_fn_jd:
+        return "resume"
+
+    # 3. Content-based scoring
+    text_lower = text.lower()
+    jd_score = 0
+    resume_score = 0
+
+    # Soft cues from filename
+    if any(k in fn for k in ("intern", "opening", "hiring", "posting", "spec", "job")):
+        jd_score += 3
+    if any(k in fn for k in ("profile", "bio", "applicant", "candidate", "resume", "cv")):
+        resume_score += 3
+
+    # JD text patterns
+    jd_patterns = [
+        r"\b(about\s+(the\s+)?(role|job|company|team|us))\b",
+        r"\b(job\s+description|job\s+summary|role\s+overview|job\s+purpose)\b",
+        r"\b(responsibilities|key\s+responsibilities|duties|what\s+you('ll|\s+will)\s+do)\b",
+        r"\b(requirements|qualifications|basic\s+qualifications|minimum\s+qualifications|preferred\s+qualifications)\b",
+        r"\b(what\s+we('re|\s+are)\s+looking\s+for|who\s+you\s+are|what\s+you\s+bring)\b",
+        r"\b(we\s+offer|benefits|perks|compensation|salary|equal\s+opportunity)\b",
+        r"\b(we\s+are\s+(seeking|looking\s+for|hiring)|the\s+ideal\s+candidate)\b",
+        r"\b(job\s+type|employment\s+type|full[- ]time|part[- ]time|contract\s+role)\b",
+        r"\b(how\s+to\s+apply|apply\s+now|submission\s+deadline)\b",
+        r"\b(years\s+of\s+experience\s+required|minimum\s+\d+\+?\s+years)\b",
+    ]
+    for pat in jd_patterns:
+        if re.search(pat, text_lower):
+            jd_score += 2
+
+    # Resume text patterns
+    resume_patterns = [
+        r"\b(work\s+experience|professional\s+experience|employment\s+history)\b",
+        r"\b(education|academic\s+background|academic\s+history)\b",
+        r"\b(bachelor|master|b\.tech|m\.tech|b\.e\b|b\.s\b|m\.s\b|ph\.d|university|college|cgpa|gpa)\b",
+        r"\b(projects?|personal\s+projects?|academic\s+projects?)\b",
+        r"\b(technical\s+skills?|core\s+competencies|key\s+skills?|areas\s+of\s+expertise)\b",
+        r"\b(certifications?|achievements?|extracurricular|publications?|honors?)\b",
+        r"\b(professional\s+summary|career\s+objective|summary\s+of\s+qualifications)\b",
+        r"\b(github\.com|linkedin\.com)\b",
+        r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}",  # email
+        r"(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}",  # phone
+    ]
+    for pat in resume_patterns:
+        if re.search(pat, text_lower):
+            resume_score += 2
+
+    if jd_score > resume_score:
+        return "jd"
+    elif resume_score > jd_score:
+        return "resume"
+
+    # If tied, check if filename has resume or jd partials
+    if "resume" in fn or "cv" in fn:
+        return "resume"
+    if "jd" in fn or "job" in fn:
+        return "jd"
+
+    # Default
+    return "resume"
 
 
 # ---------- Score helpers ----------
@@ -283,10 +365,8 @@ def format_result(resume_name: str, result: dict) -> str:
     ats = result.get("ats_score", 0)
     match = result.get("match_score", 0)
 
-    safe_name = _escape_md(resume_name)
-
     lines = [
-        f"*Resume:* {safe_name}",
+        f"*Resume:* `{resume_name}`",
         "",
         f"*ATS Score:*  `{_score_bar(ats)}`",
         f"*Match Score:* `{_score_bar(match)}`",
@@ -295,30 +375,30 @@ def format_result(resume_name: str, result: dict) -> str:
 
     matched = result.get("matched_skills", [])
     lines.append("*Matched Skills:*")
-    lines.append(_escape_md(", ".join(matched)) if matched else "None found")
+    lines.append(_clean_text(", ".join(matched)) if matched else "None found")
     lines.append("")
 
     missing = result.get("missing_skills", [])
     lines.append("*Skill Gaps:*")
-    lines.append(_escape_md(", ".join(missing)) if missing else "None")
+    lines.append(_clean_text(", ".join(missing)) if missing else "None")
     lines.append("")
 
     if result.get("strengths"):
         lines.append("*Strengths:*")
         for s in result["strengths"]:
-            lines.append(f"  - {_escape_md(str(s))}")
+            lines.append(f"  - {_clean_text(str(s))}")
         lines.append("")
 
     if result.get("course_suggestions"):
         lines.append("*Recommended Courses:*")
         for c in result["course_suggestions"]:
-            skill = _escape_md(str(c.get('skill', '')))
-            course = _escape_md(str(c.get('course', '')))
-            platform = _escape_md(str(c.get('platform', '')))
+            skill = _clean_text(str(c.get('skill', '')))
+            course = _clean_text(str(c.get('course', '')))
+            platform = _clean_text(str(c.get('platform', '')))
             lines.append(f"  - {skill} -> {course} ({platform})")
         lines.append("")
 
-    verdict = _escape_md(str(result.get('verdict', 'N/A')))
+    verdict = _clean_text(str(result.get('verdict', 'N/A')))
     lines.append(f"*Verdict:* {verdict}")
     return "\n".join(lines)
 
@@ -426,14 +506,14 @@ def _build_comparison(resumes: dict, name_a: str, name_b: str) -> str:
         "",
         table,
         "",
-        f"*Stronger fit:* {winner}",
+        f"*Stronger fit:* `{winner}`",
     ]
 
     w_match = w.get("match_score", 0)
     l_match = l.get("match_score", 0)
     diff = w_match - l_match
     if diff > 0:
-        lines.append(f"  {winner} scores {diff} points higher on match score.")
+        lines.append(f"  `{winner}` scores {diff} points higher on match score.")
     else:
         lines.append("  Scores are tied; edge given on ATS score.")
     lines.append("")
@@ -444,14 +524,14 @@ def _build_comparison(resumes: dict, name_a: str, name_b: str) -> str:
         matched = res.get("matched_skills", [])
         missing = res.get("missing_skills", [])
 
-        lines.append(f"*{name}*")
+        lines.append(f"`{name}`")
         good = matched[:5]
-        lines.append(f"  Strong at: {', '.join(good) if good else 'N/A'}")
+        lines.append(f"  Strong at: {_clean_text(', '.join(good)) if good else 'N/A'}")
         if strengths:
             for s in strengths[:3]:
-                lines.append(f"    - {s}")
+                lines.append(f"    - {_clean_text(str(s))}")
         weak = missing[:5]
-        lines.append(f"  Gaps: {', '.join(weak) if weak else 'None'}")
+        lines.append(f"  Gaps: {_clean_text(', '.join(weak)) if weak else 'None'}")
         lines.append("")
 
     return "\n".join(lines)
@@ -464,10 +544,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     STATE.pop(chat_id, None)
     await update.message.reply_text(
         "*Resume-JD Alignment Bot*\n\n"
-        "Step 1: Send the *Job Description* file (PDF/DOCX/TXT).\n"
-        "Step 2: Send one or more *Resume* files to score against the JD.\n\n"
+        "Send your *Job Description* and *Resume* files (PDF/DOCX/TXT) in any order.\n"
+        "The bot automatically identifies which is the JD and which is the Resume.\n\n"
         "Commands:\n"
-        "  /newjd  — Reset and load a different JD\n"
+        "  /newjd   — Reset and load a different JD\n"
         "  /compare — Compare last two scored resumes\n"
         "  /history — List all resumes scored this session",
         parse_mode="Markdown",
@@ -476,8 +556,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def newjd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
-    STATE.pop(chat_id, None)
-    await update.message.reply_text("Reset complete. Send the new Job Description file.")
+    if chat_id in STATE:
+        STATE[chat_id]["jd_text"] = None
+        STATE[chat_id]["jd_name"] = None
+        STATE[chat_id]["pending_resumes"] = OrderedDict()
+    await update.message.reply_text("Active JD cleared. Send a new Job Description file.")
 
 
 async def compare_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -526,8 +609,8 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No resumes scored in this session yet.")
         return
 
-    jd_name = _escape_md(state.get("jd_name", "Unknown JD"))
-    lines = [f"*Session History* (JD: {jd_name})", ""]
+    jd_name = state.get("jd_name", "Unknown JD")
+    lines = [f"*Session History* (JD: `{jd_name}`)", ""]
 
     header = f"{'#':<4} {'Resume':<28} {'ATS':>5} {'Match':>5} {'Band':<10}"
     lines.append(f"```\n{header}")
@@ -545,62 +628,37 @@ async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_text(msg, parse_mode="Markdown")
     except BadRequest:
-        plain = msg.replace("*", "").replace("`", "").replace("\\", "")
+        plain = msg.replace("*", "").replace("`", "")
         await update.message.reply_text(plain)
 
 
-async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    doc = update.message.document
-    filename = doc.file_name or "file"
-
-    try:
-        tg_file = await context.bot.get_file(doc.file_id)
-        file_bytes = await tg_file.download_as_bytearray()
-        text = extract_text(bytes(file_bytes), filename)
-    except Exception as e:
-        await update.message.reply_text(f"Could not read {filename}: {e}")
-        return
-
-    if not text.strip():
-        await update.message.reply_text(f"No extractable text found in {filename}.")
-        return
-
-    state = STATE.get(chat_id)
-
-    # First file → treat as JD
-    if state is None or "jd_text" not in state:
-        STATE[chat_id] = {"jd_text": text, "jd_name": filename, "resumes": OrderedDict()}
-        try:
-            await update.message.reply_text(
-                f"JD received: *{_escape_md(filename)}*\nNow send one or more resumes to score against it.",
-                parse_mode="Markdown",
-            )
-        except BadRequest:
-            await update.message.reply_text(
-                f"JD received: {filename}\nNow send one or more resumes to score against it."
-            )
-        return
-
-    # Subsequent files → treat as resumes
+async def _score_and_reply_resume(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    state: dict,
+    filename: str,
+    text: str,
+):
+    """Analyze a resume against the active JD and send the report + chart."""
+    jd_name = state.get("jd_name", "Job Description")
     try:
         await update.message.reply_text(
-            f"Analyzing *{_escape_md(filename)}* against *{_escape_md(state['jd_name'])}*...",
+            f"Analyzing `{filename}` against `{jd_name}`...",
             parse_mode="Markdown",
         )
     except BadRequest:
         await update.message.reply_text(
-            f"Analyzing {filename} against {state['jd_name']}..."
+            f"Analyzing {filename} against {jd_name}..."
         )
+
     try:
         result = analyze(state["jd_text"], text)
     except RuntimeError as e:
-        # Catches our wrapped RateLimitError
         await update.message.reply_text(str(e))
         return
     except json.JSONDecodeError:
         await update.message.reply_text(
-            "Could not parse the AI response. Please resend the resume."
+            f"Could not parse the AI response for {filename}. Please resend the resume."
         )
         return
     except Exception as e:
@@ -611,13 +669,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Cache result
     state.setdefault("resumes", OrderedDict())[filename] = result
 
-    # Send text result — fall back to plain text if Markdown parsing fails
+    # Send text result
     msg = format_result(filename, result)
     try:
         await update.message.reply_text(msg, parse_mode="Markdown")
     except BadRequest:
-        # Strip Markdown formatting and send as plain text
-        plain = msg.replace("*", "").replace("`", "").replace("\\", "")
+        plain = msg.replace("*", "").replace("`", "")
         await update.message.reply_text(plain)
 
     # Send chart for this resume
@@ -642,9 +699,104 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    doc = update.message.document
+    filename = doc.file_name or "file"
+    caption = update.message.caption or ""
+
+    try:
+        tg_file = await context.bot.get_file(doc.file_id)
+        file_bytes = await tg_file.download_as_bytearray()
+        text = extract_text(bytes(file_bytes), filename)
+    except Exception as e:
+        await update.message.reply_text(f"Could not read {filename}: {e}")
+        return
+
+    if not text.strip():
+        await update.message.reply_text(f"No extractable text found in {filename}.")
+        return
+
+    state = STATE.setdefault(chat_id, {
+        "jd_text": None,
+        "jd_name": None,
+        "resumes": OrderedDict(),
+        "pending_resumes": OrderedDict(),
+    })
+
+    doc_type = classify_document(filename, text, caption=caption)
+    logger.info("Classified %s as %s (chat_id=%s)", filename, doc_type, chat_id)
+
+    if doc_type == "jd":
+        old_jd = state.get("jd_name")
+        state["jd_text"] = text
+        state["jd_name"] = filename
+
+        if old_jd:
+            try:
+                await update.message.reply_text(
+                    f"Job Description updated to: `{filename}`",
+                    parse_mode="Markdown",
+                )
+            except BadRequest:
+                await update.message.reply_text(f"Job Description updated to: {filename}")
+        else:
+            try:
+                await update.message.reply_text(
+                    f"Job Description received: `{filename}`",
+                    parse_mode="Markdown",
+                )
+            except BadRequest:
+                await update.message.reply_text(f"Job Description received: {filename}")
+
+        # Check for pending resumes uploaded before this JD
+        pending = state.get("pending_resumes", OrderedDict())
+        if pending:
+            pending_count = len(pending)
+            try:
+                await update.message.reply_text(
+                    f"Found {pending_count} pending resume(s). Analyzing against `{filename}` now...",
+                    parse_mode="Markdown",
+                )
+            except BadRequest:
+                await update.message.reply_text(
+                    f"Found {pending_count} pending resume(s). Analyzing against {filename} now..."
+                )
+            # Process each pending resume
+            items_to_process = list(pending.items())
+            pending.clear()
+            for r_name, r_text in items_to_process:
+                await _score_and_reply_resume(update, context, state, r_name, r_text)
+        else:
+            await update.message.reply_text("Now send one or more resumes to score against it.")
+        return
+
+    # Otherwise, it's a resume
+    if not state.get("jd_text"):
+        # No JD loaded yet! Store in pending_resumes
+        state.setdefault("pending_resumes", OrderedDict())[filename] = text
+        try:
+            await update.message.reply_text(
+                f"Resume received: `{filename}`\n\n"
+                "No Job Description (JD) loaded yet.\n"
+                "Please send the Job Description file (PDF/DOCX/TXT) to analyze this resume against!",
+                parse_mode="Markdown",
+            )
+        except BadRequest:
+            await update.message.reply_text(
+                f"Resume received: {filename}\n\n"
+                "No Job Description (JD) loaded yet.\n"
+                "Please send the Job Description file (PDF/DOCX/TXT) to analyze this resume against!"
+            )
+        return
+
+    # Active JD exists -> score resume immediately!
+    await _score_and_reply_resume(update, context, state, filename, text)
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Please send a PDF, DOCX, or TXT file (JD first, then resumes). Use /start for instructions."
+        "Please send a PDF, DOCX, or TXT file (JD or Resume). Use /start for instructions."
     )
 
 

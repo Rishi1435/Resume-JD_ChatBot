@@ -8,7 +8,10 @@ import pytest
 from collections import OrderedDict
 
 # Import helpers from main module
-from main import _filter_courses, _clamp_scores, _score_band, _build_comparison
+from main import (
+    _filter_courses, _clamp_scores, _score_band, _build_comparison,
+    classify_document,
+)
 
 
 # ---------- Course filter tests ----------
@@ -203,3 +206,69 @@ class TestBuildComparison:
         }
         text = _build_comparison(resumes, "a.pdf", "b.pdf")
         assert "Stronger fit:" in text
+
+
+# ---------- Document classification tests ----------
+
+class TestClassifyDocument:
+    """Verify document auto-detection properly identifies JDs vs Resumes."""
+
+    def test_classify_user_resume_filename(self):
+        """Rishi_Resume_Software_developer_.pdf should be classified as resume."""
+        doc_type = classify_document("Rishi_Resume_Software_developer_.pdf", "Python developer")
+        assert doc_type == "resume"
+
+    def test_classify_user_jd_filename(self):
+        """DLMLE Intern JD 2027.pdf should be classified as jd."""
+        doc_type = classify_document("DLMLE Intern JD 2027.pdf", "Machine Learning internship requirements")
+        assert doc_type == "jd"
+
+    def test_classify_cv_filename(self):
+        """John_Doe_CV.docx should be classified as resume."""
+        doc_type = classify_document("John_Doe_CV.docx", "")
+        assert doc_type == "resume"
+
+    def test_classify_job_description_filename(self):
+        """Senior_Backend_Job_Description.pdf should be classified as jd."""
+        doc_type = classify_document("Senior_Backend_Job_Description.pdf", "")
+        assert doc_type == "jd"
+
+    def test_classify_by_content_when_filename_generic(self):
+        """Generic filename 'document.pdf' classified by resume content cues."""
+        resume_text = """
+        John Doe
+        john.doe@example.com | +1 555-0199 | github.com/johndoe | linkedin.com/in/johndoe
+        Education:
+        B.Tech in Computer Science, GPA 3.8, ABC University
+        Professional Experience:
+        Software Engineer at Acme Corp (2022-Present)
+        Technical Skills:
+        Python, C++, AWS, Docker, Kubernetes
+        Personal Projects:
+        Developed automated ATS scanner
+        """
+        assert classify_document("document.pdf", resume_text) == "resume"
+
+    def test_classify_by_content_when_jd_content(self):
+        """Generic filename 'doc1.pdf' classified by JD content cues."""
+        jd_text = """
+        About the Role:
+        We are seeking a Machine Learning Engineer to join our team.
+        Key Responsibilities:
+        - Design and deploy machine learning models in production.
+        - Collaborate with backend engineers to integrate APIs.
+        Minimum Qualifications:
+        - 3+ years of experience in Python and PyTorch.
+        What We Offer:
+        - Competitive salary, health benefits, and 401(k) matching.
+        Apply now by submitting your resume.
+        """
+        assert classify_document("doc1.pdf", jd_text) == "jd"
+
+    def test_caption_override_jd(self):
+        """Explicit caption 'jd' forces document classification to jd."""
+        assert classify_document("ambiguous.pdf", "Some random text", caption="jd") == "jd"
+
+    def test_caption_override_resume(self):
+        """Explicit caption 'resume' forces document classification to resume."""
+        assert classify_document("ambiguous.pdf", "Some random text", caption="resume") == "resume"

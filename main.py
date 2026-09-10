@@ -29,6 +29,7 @@ import matplotlib.pyplot as plt
 
 from dotenv import load_dotenv
 from telegram import Update
+from telegram.error import BadRequest
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, ContextTypes, filters
 )
@@ -93,6 +94,19 @@ def extract_text(file_bytes: bytes, filename: str) -> str:
         return file_bytes.decode("utf-8", errors="ignore")
     else:
         raise ValueError("Unsupported file type. Please send a PDF, DOCX, or TXT file.")
+
+
+# ---------- Telegram Markdown escaping ----------
+
+def _escape_md(text: str) -> str:
+    """Escape Telegram Markdown V1 special characters in user/LLM content.
+    We use Markdown V1 (parse_mode='Markdown') which treats * _ ` [ as special.
+    """
+    # Replace backslash first to avoid double-escaping
+    text = text.replace("\\", "\\\\")
+    for ch in ("*", "_", "`", "["):
+        text = text.replace(ch, f"\\{ch}")
+    return text
 
 
 # ---------- Score helpers ----------
@@ -267,8 +281,10 @@ def format_result(resume_name: str, result: dict) -> str:
     ats = result.get("ats_score", 0)
     match = result.get("match_score", 0)
 
+    safe_name = _escape_md(resume_name)
+
     lines = [
-        f"*Resume:* {resume_name}",
+        f"*Resume:* {safe_name}",
         "",
         f"*ATS Score:*  `{_score_bar(ats)}`",
         f"*Match Score:* `{_score_bar(match)}`",
@@ -277,27 +293,31 @@ def format_result(resume_name: str, result: dict) -> str:
 
     matched = result.get("matched_skills", [])
     lines.append("*Matched Skills:*")
-    lines.append(", ".join(matched) if matched else "None found")
+    lines.append(_escape_md(", ".join(matched)) if matched else "None found")
     lines.append("")
 
     missing = result.get("missing_skills", [])
     lines.append("*Skill Gaps:*")
-    lines.append(", ".join(missing) if missing else "None")
+    lines.append(_escape_md(", ".join(missing)) if missing else "None")
     lines.append("")
 
     if result.get("strengths"):
         lines.append("*Strengths:*")
         for s in result["strengths"]:
-            lines.append(f"  - {s}")
+            lines.append(f"  - {_escape_md(str(s))}")
         lines.append("")
 
     if result.get("course_suggestions"):
         lines.append("*Recommended Courses:*")
         for c in result["course_suggestions"]:
-            lines.append(f"  - {c.get('skill')} -> {c.get('course')} ({c.get('platform')})")
+            skill = _escape_md(str(c.get('skill', '')))
+            course = _escape_md(str(c.get('course', '')))
+            platform = _escape_md(str(c.get('platform', '')))
+            lines.append(f"  - {skill} -> {course} ({platform})")
         lines.append("")
 
-    lines.append(f"*Verdict:* {result.get('verdict', 'N/A')}")
+    verdict = _escape_md(str(result.get('verdict', 'N/A')))
+    lines.append(f"*Verdict:* {verdict}")
     return "\n".join(lines)
 
 
@@ -540,15 +560,27 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # First file → treat as JD
     if state is None or "jd_text" not in state:
         STATE[chat_id] = {"jd_text": text, "jd_name": filename, "resumes": OrderedDict()}
-        await update.message.reply_text(
-            f"JD received: *{filename}*\nNow send one or more resumes to score against it.",
-            parse_mode="Markdown",
-        )
+        try:
+            await update.message.reply_text(
+                f"JD received: *{_escape_md(filename)}*\nNow send one or more resumes to score against it.",
+                parse_mode="Markdown",
+            )
+        except BadRequest:
+            await update.message.reply_text(
+                f"JD received: {filename}\nNow send one or more resumes to score against it."
+            )
         return
 
     # Subsequent files → treat as resumes
-    await update.message.reply_text(f"Analyzing *{filename}* against *{state['jd_name']}*...",
-                                    parse_mode="Markdown")
+    try:
+        await update.message.reply_text(
+            f"Analyzing *{_escape_md(filename)}* against *{_escape_md(state['jd_name'])}*...",
+            parse_mode="Markdown",
+        )
+    except BadRequest:
+        await update.message.reply_text(
+            f"Analyzing {filename} against {state['jd_name']}..."
+        )
     try:
         result = analyze(state["jd_text"], text)
     except RuntimeError as e:
@@ -568,9 +600,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Cache result
     state.setdefault("resumes", OrderedDict())[filename] = result
 
-    # Send text result
+    # Send text result — fall back to plain text if Markdown parsing fails
     msg = format_result(filename, result)
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    try:
+        await update.message.reply_text(msg, parse_mode="Markdown")
+    except BadRequest:
+        # Strip Markdown formatting and send as plain text
+        plain = msg.replace("*", "").replace("`", "").replace("\\", "")
+        await update.message.reply_text(plain)
 
     # Send chart for this resume
     try:
